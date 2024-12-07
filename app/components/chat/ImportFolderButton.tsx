@@ -79,7 +79,7 @@ ${content}
       role: 'assistant',
       content: `I'll help you set up these files.${binaryFilesMessage}
 
-<boltArtifact id="imported-files" title="Imported Files">
+<boltArtifact id="imported-files" title="Imported Files" type="bundled">
 ${fileArtifacts.join('\n\n')}
 </boltArtifact>`,
       id: generateId(),
@@ -156,7 +156,7 @@ ${fileArtifacts.join('\n\n')}
         }}
         className={className}
       >
-        <div className="i-ph:folder-simple-upload" />
+        <div className="i-ph:upload-simple" />
         Import Folder
       </button>
     </>

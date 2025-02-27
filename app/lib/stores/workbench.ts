@@ -10,11 +10,16 @@ import { FilesStore, type FileMap } from './files';
 import { PreviewsStore } from './previews';
 import { TerminalStore } from './terminal';
 import JSZip from 'jszip';
-import { saveAs } from 'file-saver';
+import fileSaver from 'file-saver';
 import { Octokit, type RestEndpointMethodTypes } from '@octokit/rest';
-import * as nodePath from 'node:path';
+import { path } from '~/utils/path';
 import { extractRelativePath } from '~/utils/diff';
 import { description } from '~/lib/persistence';
+import Cookies from 'js-cookie';
+import { createSampler } from '~/utils/sampler';
+import type { ActionAlert } from '~/types/actions';
+
+const { saveAs } = fileSaver;
 
 export interface ArtifactState {
   id: string;
@@ -28,7 +33,7 @@ export type ArtifactUpdateState = Pick<ArtifactState, 'title' | 'closed'>;
 
 type Artifacts = MapStore<Record<string, ArtifactState>>;
 
-export type WorkbenchViewType = 'code' | 'preview';
+export type WorkbenchViewType = 'code' | 'diff' | 'preview';
 
 export class WorkbenchStore {
   #previewsStore = new PreviewsStore(webcontainer);
@@ -36,11 +41,15 @@ export class WorkbenchStore {
   #editorStore = new EditorStore(this.#filesStore);
   #terminalStore = new TerminalStore(webcontainer);
 
+  #reloadedMessages = new Set<string>();
+
   artifacts: Artifacts = import.meta.hot?.data.artifacts ?? map({});
 
   showWorkbench: WritableAtom<boolean> = import.meta.hot?.data.showWorkbench ?? atom(false);
   currentView: WritableAtom<WorkbenchViewType> = import.meta.hot?.data.currentView ?? atom('code');
   unsavedFiles: WritableAtom<Set<string>> = import.meta.hot?.data.unsavedFiles ?? atom(new Set<string>());
+  actionAlert: WritableAtom<ActionAlert | undefined> =
+    import.meta.hot?.data.unsavedFiles ?? atom<ActionAlert | undefined>(undefined);
   modifiedFiles = new Set<string>();
   artifactIdList: string[] = [];
   #globalExecutionQueue = Promise.resolve();
@@ -50,6 +59,7 @@ export class WorkbenchStore {
       import.meta.hot.data.unsavedFiles = this.unsavedFiles;
       import.meta.hot.data.showWorkbench = this.showWorkbench;
       import.meta.hot.data.currentView = this.currentView;
+      import.meta.hot.data.actionAlert = this.actionAlert;
     }
   }
 
@@ -86,6 +96,12 @@ export class WorkbenchStore {
   }
   get boltTerminal() {
     return this.#terminalStore.boltTerminal;
+  }
+  get alert() {
+    return this.actionAlert;
+  }
+  clearAlert() {
+    this.actionAlert.set(undefined);
   }
 
   toggleTerminal(value?: boolean) {
@@ -222,6 +238,9 @@ export class WorkbenchStore {
   getFileModifcations() {
     return this.#filesStore.getFileModifications();
   }
+  getModifiedFiles() {
+    return this.#filesStore.getModifiedFiles();
+  }
 
   resetAllFileModifications() {
     this.#filesStore.resetFileModifications();
@@ -229,6 +248,10 @@ export class WorkbenchStore {
 
   abortAllActions() {
     // TODO: what do we wanna do and how do we wanna recover from this?
+  }
+
+  setReloadedMessages(messages: string[]) {
+    this.#reloadedMessages = new Set(messages);
   }
 
   addArtifact({ messageId, title, id, type }: ArtifactCallbackData) {
@@ -247,7 +270,17 @@ export class WorkbenchStore {
       title,
       closed: false,
       type,
-      runner: new ActionRunner(webcontainer, () => this.boltTerminal),
+      runner: new ActionRunner(
+        webcontainer,
+        () => this.boltTerminal,
+        (alert) => {
+          if (this.#reloadedMessages.has(messageId)) {
+            return;
+          }
+
+          this.actionAlert.set(alert);
+        },
+      ),
     });
   }
 
@@ -261,9 +294,9 @@ export class WorkbenchStore {
     this.artifacts.setKey(messageId, { ...artifact, ...state });
   }
   addAction(data: ActionCallbackData) {
-    this._addAction(data);
+    // this._addAction(data);
 
-    // this.addToExecutionQueue(()=>this._addAction(data))
+    this.addToExecutionQueue(() => this._addAction(data));
   }
   async _addAction(data: ActionCallbackData) {
     const { messageId } = data;
@@ -279,7 +312,7 @@ export class WorkbenchStore {
 
   runAction(data: ActionCallbackData, isStreaming: boolean = false) {
     if (isStreaming) {
-      this._runAction(data, isStreaming);
+      this.actionStreamSampler(data, isStreaming);
     } else {
       this.addToExecutionQueue(() => this._runAction(data, isStreaming));
     }
@@ -293,9 +326,15 @@ export class WorkbenchStore {
       unreachable('Artifact not found');
     }
 
+    const action = artifact.runner.actions.get()[data.actionId];
+
+    if (!action || action.executed) {
+      return;
+    }
+
     if (data.action.type === 'file') {
       const wc = await webcontainer;
-      const fullPath = nodePath.join(wc.workdir, data.action.filePath);
+      const fullPath = path.join(wc.workdir, data.action.filePath);
 
       if (this.selectedFile.value !== fullPath) {
         this.setSelectedFile(fullPath);
@@ -321,6 +360,10 @@ export class WorkbenchStore {
       await artifact.runner.runAction(data);
     }
   }
+
+  actionStreamSampler = createSampler(async (data: ActionCallbackData, isStreaming: boolean = false) => {
+    return await this._runAction(data, isStreaming);
+  }, 100); // TODO: remove this magic number to have it configurable
 
   #getArtifact(id: string) {
     const artifacts = this.artifacts.get();
@@ -396,15 +439,14 @@ export class WorkbenchStore {
     return syncedFiles;
   }
 
-  async pushToGitHub(repoName: string, githubUsername: string, ghToken: string) {
+  async pushToGitHub(repoName: string, commitMessage?: string, githubUsername?: string, ghToken?: string) {
     try {
-      // Get the GitHub auth token from environment variables
-      const githubToken = ghToken;
+      // Use cookies if username and token are not provided
+      const githubToken = ghToken || Cookies.get('githubToken');
+      const owner = githubUsername || Cookies.get('githubUsername');
 
-      const owner = githubUsername;
-
-      if (!githubToken) {
-        throw new Error('GitHub token is not set in environment variables');
+      if (!githubToken || !owner) {
+        throw new Error('GitHub token or username is not set in cookies or provided.');
       }
 
       // Initialize Octokit with the auth token
@@ -486,7 +528,7 @@ export class WorkbenchStore {
       const { data: newCommit } = await octokit.git.createCommit({
         owner: repo.owner.login,
         repo: repo.name,
-        message: 'Initial commit from your app',
+        message: commitMessage || 'Initial commit from your app',
         tree: newTree.sha,
         parents: [latestCommitSha],
       });
@@ -501,7 +543,8 @@ export class WorkbenchStore {
 
       alert(`Repository created and code pushed: ${repo.html_url}`);
     } catch (error) {
-      console.error('Error pushing to GitHub:', error instanceof Error ? error.message : String(error));
+      console.error('Error pushing to GitHub:', error);
+      throw error; // Rethrow the error for further handling
     }
   }
 }
